@@ -8,4 +8,3 @@ and publish to streaming platforms including YouTube, Spotify, and Amazon Music.
 - Generate ffmpeg pipelines for audio and video processing
 - Package content for YouTube (MP4 with chapters), Spotify, and Amazon Music
 - Support for analog sources (cassette tape rips, VHS captures)
-
