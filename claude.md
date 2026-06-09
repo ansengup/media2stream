@@ -1,10 +1,18 @@
 # media2stream
 
-A utility to digitize audio and video content (digital and analog/cassette) 
-and publish to streaming platforms including YouTube, Spotify, and Amazon Music.
+Utilities to digitize audio and video content (digital and analog) 
+and publish to YouTube, Spotify, Amazon Music, and other platforms.
 
-## Capabilities
-- Rename and tag MP3/MP4 files from CD/DVD inserts or metadata
-- Generate ffmpeg pipelines for audio and video processing
-- Package content for YouTube (MP4 with chapters), Spotify, and Amazon Music
-- Support for analog sources (cassette tape rips, VHS captures)
+## Structure
+Each utility lives in `utilities/<name>/` with its own CLAUDE.md.
+Shared code and schemas are in `shared/`.
+
+## Conventions
+- Python 3, standard library only unless noted in the utility's CLAUDE.md
+- ffmpeg for all audio/video processing
+- Config files use YAML
+- Shell scripts must be POSIX-compatible and pass ShellCheck
+
+## Dependencies
+- ffmpeg (`brew install ffmpeg`)
+- Python 3.10+
