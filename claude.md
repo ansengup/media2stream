@@ -8,7 +8,7 @@ Each utility lives in `utilities/<name>/` with its own CLAUDE.md.
 Shared code and schemas are in `shared/`.
 
 ## Conventions
-- Python 3, standard library only unless noted in the utility's CLAUDE.md
+- Prefer Python 3, standard library only unless absolutely necessary to use an extternal library or noted in the utility's CLAUDE.md
 - ffmpeg for all audio/video processing
 - Config files use YAML
 - Shell scripts must be POSIX-compatible and pass ShellCheck
