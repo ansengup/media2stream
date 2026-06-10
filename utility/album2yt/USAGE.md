@@ -126,13 +126,23 @@ title: "Album Title"              # required
 artist: "Artist Name"             # required
 folder_structure: auto            # auto | single_disc | multi_disc_flat | multi_folder | multi_folder_top
 input_dir: "/path/to/mp3s"        # optional; overridden by --input CLI flag
+youtube:                          # optional; YouTube description customisation
+  description_header: "header.txt"  # text prepended to every disc description
+  description_footer: "footer.txt"  # text appended to every disc description
+covers:                           # optional; album-level covers applied to all discs
+  mode: hold                      # hold | slideshow; overridden per-disc if disc has own covers
+  intro:                          # optional; slideshow only — shown once at start, not cycled
+    file: "album-cover.jpg"
+    duration: 30                  # seconds; defaults to interval if omitted
+  images:
+    - file: "cover.jpg"
 
 discs:
   - number: 1                     # required
     name: "Disc Name"             # required
     duration: "69:10"             # optional MM:SS or HH:MM:SS — used only for sanity-check
     folder: "Album Name - Disc 1" # optional; multi_folder_top only, if auto-detection is wrong
-    covers:                       # optional; see Cover images section
+    covers:                       # optional; disc-level covers override album-level covers
       mode: hold
       images:
         - file: "cover.jpg"
@@ -202,11 +212,22 @@ discs:
     covers:
       mode: slideshow
       interval: 30                # seconds per image
+      intro:                      # optional; shown once at the start, never repeated
+        file: "album-cover.jpg"
+        duration: 30              # seconds; defaults to interval if omitted
       images:
         - file: "cover1.jpg"
         - file: "cover2.jpg"
         - file: "cover3.jpg"
 ```
+
+The `intro` image appears at the very beginning of the video and is **not**
+included in the cycling `images` list. Use it for an album cover that should
+open the video once without repeating in the rotation.
+
+`intro` is only supported in `slideshow` mode. In `hold` mode the first entry
+in `images` naturally acts as an intro (it shows from track 1 until the next
+`from_track` entry).
 
 ### Per-track override
 
@@ -223,13 +244,16 @@ tracks:
 
 1. Per-track `cover:` in YAML
 2. Disc-level `covers:` section in YAML
-3. `--cover` CLI flag
-4. `cover.jpg` in input folder
+3. Album-level `covers:` section in YAML
+4. `--cover` CLI flag
+5. `cover.jpg` in input folder
 
-All image paths are relative to the input folder unless absolute. Images of
-any dimensions are accepted — odd dimensions are rounded down to even
-automatically (`-vf "scale=trunc(iw/2)*2:trunc(ih/2)*2"`), as required by
-the H.264 encoder.
+All image paths are relative to the input folder unless absolute. If not found
+there, they are resolved relative to the config (YAML) folder.
+
+Images of any dimensions and aspect ratio are accepted. Each image is scaled
+to fit within 1920×1080 while preserving its aspect ratio, with black
+letterbox or pillarbox bars filling the remaining space.
 
 ---
 
@@ -383,6 +407,8 @@ The `chapters` step also generates three files to assist with uploading:
 
 **`discN_youtube_description.txt`** — ready-to-paste YouTube description:
 ```
+[header.txt contents — if specified]
+
 <Album Title> — Disc N: <Disc Name>
 <Artist>
 
@@ -391,8 +417,22 @@ Chapters:
 4:32 Track 2 Title
 ...
 
-[Playlist: <link — paste after upload>]
+Playlist Link:
+
+[footer.txt contents — if specified]
 ```
+
+Header and footer are optional text files specified in the YAML under `youtube:`:
+
+```yaml
+youtube:
+  description_header: "templates/header.txt"
+  description_footer: "templates/footer.txt"
+```
+
+Paths are relative to the config (YAML) folder, or absolute. A missing file
+prints a warning and is silently skipped. The same header/footer applies to
+every disc in the album.
 
 **`youtube_playlist.txt`** — playlist title and ordered video list.
 

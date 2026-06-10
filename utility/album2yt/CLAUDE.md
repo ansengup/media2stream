@@ -163,13 +163,23 @@ artist: "Artist Name"                         # required
 folder_structure: auto                        # auto | single_disc | multi_disc_flat | multi_folder | multi_folder_top
 input_dir: "/path/to/mp3s"                    # optional; overridden by --input CLI flag
                                               # default: same folder as YAML file
+youtube:                                      # optional; YouTube description customisation
+  description_header: "header.txt"           # text file prepended to every disc description
+  description_footer: "footer.txt"           # text file appended to every disc description
+covers:                                       # optional; album-level covers applied to all discs
+  mode: hold                                  # hold | slideshow; overridden by disc-level covers
+  intro:                                      # optional; slideshow only — shown once at start, not cycled
+    file: "album-cover.jpg"
+    duration: 30                              # seconds; defaults to interval if omitted
+  images:
+    - file: "cover.jpg"
 discs:
   - number: 1                                 # required, integer
     name: "Disc Name"                         # required, e.g. "Awakening"
     duration: "69:10"                         # optional, MM:SS or HH:MM:SS
     folder: "Album Name - Disc 1"             # optional; only needed for multi_folder_top
                                               # if auto-detection gets the folder name wrong
-    covers:                                   # optional; see Cover images section below
+    covers:                                   # optional; disc-level covers override album-level
       mode: hold                              # hold | slideshow
       images:
         - file: "cover.jpg"                   # default for whole disc
@@ -282,11 +292,18 @@ discs:
     covers:
       mode: slideshow
       interval: 30            # seconds per image
+      intro:                  # optional; shown once at the very start, never cycled
+        file: "album-cover.jpg"
+        duration: 30          # seconds to hold intro; defaults to interval if omitted
       images:
         - file: "cover1.jpg"
         - file: "cover2.jpg"
         - file: "cover3.jpg"
 ```
+
+`intro` is only supported in `slideshow` mode. In `hold` mode the first image
+in the `images` list already functions as a one-time intro (it shows from
+track 1 until the next `from_track` entry).
 
 ### Per-track image override
 Any track can specify its own image, overriding the disc-level cover setting.
@@ -302,13 +319,17 @@ tracks:
 Priority order:
 1. Per-track `cover:` in YAML
 2. Disc-level `covers:` section in YAML
-3. `--cover` CLI flag
-4. `cover.jpg` in input folder (default fallback)
+3. Album-level `covers:` section in YAML
+4. `--cover` CLI flag
+5. `cover.jpg` in input folder (default fallback)
 
-All image paths are relative to the input folder unless absolute.
-Cover images of any dimensions are accepted — ffmpeg always applies
-`-vf "scale=trunc(iw/2)*2:trunc(ih/2)*2"` to round odd dimensions down to
-the nearest even number, which is required by the H.264 encoder.
+All image paths are relative to the input folder unless absolute. If not found
+there, they are resolved relative to the config (YAML) folder.
+
+Cover images of any dimensions and aspect ratio are accepted. ffmpeg scales
+each image to fit within 1920×1080 while preserving the original aspect ratio,
+then pads the remaining area with black (letterbox or pillarbox as needed):
+`scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black`
 
 ---
 
@@ -642,6 +663,36 @@ Upload checklist — <Album Title>
     Tags:        <artist>, <album title>, disc 1, <name>
 
 [ ] Disc 2: ...
+```
+
+### Description header and footer
+
+Optional blurb text files can be prepended and/or appended to every disc's
+`discN_youtube_description.txt`. Specify file paths under the `youtube:` key
+at the album level:
+
+```yaml
+youtube:
+  description_header: "templates/header.txt"
+  description_footer: "templates/footer.txt"
+```
+
+Paths are relative to the config (YAML) folder, or absolute. If a file is
+specified but not found, a `WARN` is printed and the field is silently omitted.
+The resulting description layout is:
+
+```
+[header.txt contents]
+
+<Album Title> — Disc N: <Disc Name>
+<Artist>
+
+Chapters:
+0:00 ...
+
+[Playlist: <link>]
+
+[footer.txt contents]
 ```
 
 ### Future: automated upload

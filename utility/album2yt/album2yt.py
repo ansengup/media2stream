@@ -48,8 +48,11 @@ def run_ffmpeg(*args):
         raise RuntimeError(f"ffmpeg failed (exit {result.returncode})")
 
 
-# H.264 requires even dimensions; always apply this filter.
-SCALE = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+# Scale to 1920x1080, preserving aspect ratio, with black letterbox/pillarbox padding.
+SCALE = (
+    "scale=1920:1080:force_original_aspect_ratio=decrease,"
+    "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +104,8 @@ def detect_structure(cfg, input_dir):
     if declared != "auto":
         return declared
 
-    audio = list(input_dir.glob("*.mp3"))
+    audio = [f for f in input_dir.glob("*.mp3")
+             if not re.match(r'^disc\d+_audio\.mp3$', f.name)]
 
     if not audio:
         siblings = [d for d in input_dir.parent.iterdir() if d.is_dir()]
@@ -263,17 +267,32 @@ def step_rename(cfg, disc_folders, structure, discs_filter, force_rename,
 # Image schedule helpers (used by chapters and mp4 steps)
 # ---------------------------------------------------------------------------
 
-def build_image_schedule(disc, disc_folder, default_cover, track_durations):
+def _resolve_image(file_str, disc_folder, config_dir):
+    """Resolve an image path: absolute as-is, else disc_folder, else config_dir."""
+    p = Path(file_str)
+    if p.is_absolute():
+        return p
+    candidate = disc_folder / p
+    if candidate.exists():
+        return candidate
+    return config_dir / p
+
+
+def build_image_schedule(disc, disc_folder, default_cover, track_durations,
+                         album_covers=None, config_dir=None):
     """
     Return [(image_path, duration_secs), ...] covering all tracks in
     track_durations. Handles single image, hold mode, slideshow, and
     per-track overrides.
+
+    Disc-level covers take priority over album-level covers.
     """
-    covers_cfg = disc.get("covers")
+    config_dir = config_dir or disc_folder
+    covers_cfg = disc.get("covers") or album_covers
     tracks = [t for t in disc["tracks"] if t["number"] in track_durations]
 
     per_track = {
-        t["number"]: disc_folder / t["cover"]
+        t["number"]: _resolve_image(t["cover"], disc_folder, config_dir)
         for t in tracks if "cover" in t
     }
 
@@ -283,19 +302,19 @@ def build_image_schedule(disc, disc_folder, default_cover, track_durations):
 
     if covers_cfg and covers_cfg.get("mode") == "slideshow":
         total = sum(track_durations.values())
-        return _slideshow_schedule(covers_cfg, disc_folder, total)
+        return _slideshow_schedule(covers_cfg, disc_folder, config_dir, total)
 
-    return _hold_schedule(tracks, covers_cfg, disc_folder, default_cover,
-                          track_durations, per_track)
+    return _hold_schedule(tracks, covers_cfg, disc_folder, config_dir,
+                          default_cover, track_durations, per_track)
 
 
-def _hold_schedule(tracks, covers_cfg, disc_folder, default_cover,
-                   track_durations, per_track):
+def _hold_schedule(tracks, covers_cfg, disc_folder, config_dir,
+                   default_cover, track_durations, per_track):
     section_changes = {}
     if covers_cfg and covers_cfg.get("mode") == "hold":
         for entry in covers_cfg.get("images", []):
             from_t = entry.get("from_track", 1)
-            section_changes[from_t] = disc_folder / entry["file"]
+            section_changes[from_t] = _resolve_image(entry["file"], disc_folder, config_dir)
 
     current_image = default_cover
     schedule = []  # [[Path, float], ...]
@@ -314,13 +333,23 @@ def _hold_schedule(tracks, covers_cfg, disc_folder, default_cover,
     return [(p, d) for p, d in schedule]
 
 
-def _slideshow_schedule(covers_cfg, disc_folder, total_duration):
+def _slideshow_schedule(covers_cfg, disc_folder, config_dir, total_duration):
     interval = covers_cfg.get("interval", 30)
-    images = [disc_folder / e["file"] for e in covers_cfg.get("images", [])]
+    images = [_resolve_image(e["file"], disc_folder, config_dir)
+              for e in covers_cfg.get("images", [])]
     if not images:
         return []
     schedule = []
     remaining = total_duration
+
+    # Intro image: shown once at the start, not included in the cycling rotation.
+    intro_cfg = covers_cfg.get("intro")
+    if intro_cfg and remaining > 0:
+        intro_path = _resolve_image(intro_cfg["file"], disc_folder, config_dir)
+        intro_dur = min(float(intro_cfg.get("duration", interval)), remaining)
+        schedule.append([intro_path, intro_dur])
+        remaining -= intro_dur
+
     idx = 0
     while remaining > 0:
         img = images[idx % len(images)]
@@ -377,15 +406,32 @@ def _write_yt_chapters(path, tracks, track_durations):
             offset += track_durations.get(t["number"], 0.0)
 
 
-def _write_disc_description(path, cfg, disc, track_durations, tracks):
+def _read_blurb(file_str, config_dir):
+    """Read a description blurb text file. Resolves relative to config_dir."""
+    if not file_str:
+        return None
+    p = Path(file_str)
+    resolved = p if p.is_absolute() else config_dir / p
+    if not resolved.exists():
+        print(f"  WARN  blurb file not found: {resolved}")
+        return None
+    return resolved.read_text(encoding="utf-8").strip()
+
+
+def _write_disc_description(path, cfg, disc, track_durations, tracks,
+                             header=None, footer=None):
     with open(path, "w", encoding="utf-8") as f:
+        if header:
+            f.write(header + "\n\n")
         f.write(f"{cfg['title']} — Disc {disc['number']}: {disc['name']}\n")
         f.write(f"{cfg['artist']}\n\nChapters:\n")
         offset = 0.0
         for t in sorted(tracks, key=lambda x: x["number"]):
             f.write(f"{hms(offset)} {t['title']}\n")
             offset += track_durations.get(t["number"], 0.0)
-        f.write("\n[Playlist: <link — paste after upload>]\n")
+        f.write("\nPlaylist Link:\n")
+        if footer:
+            f.write("\n" + footer + "\n")
 
 
 def _write_playlist(path, cfg):
@@ -413,6 +459,11 @@ def _write_checklist(path, cfg):
 def step_chapters(cfg, disc_folders, structure, output_dir, discs_filter, tracks_limit):
     print("\n=== chapters ===")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    config_dir = cfg["_config_dir"]
+    yt_cfg = cfg.get("youtube", {})
+    header = _read_blurb(yt_cfg.get("description_header"), config_dir)
+    footer = _read_blurb(yt_cfg.get("description_footer"), config_dir)
 
     for disc in cfg.get("discs", []):
         n = disc["number"]
@@ -445,7 +496,8 @@ def step_chapters(cfg, disc_folders, structure, output_dir, discs_filter, tracks
         _write_chapter_metadata(out(f"disc{n}_metadata.txt"), tracks, track_durations)
         _write_yt_chapters(out(f"disc{n}_youtube_chapters.txt"), tracks, track_durations)
         _write_disc_description(
-            out(f"disc{n}_youtube_description.txt"), cfg, disc, track_durations, tracks
+            out(f"disc{n}_youtube_description.txt"), cfg, disc, track_durations, tracks,
+            header=header, footer=footer
         )
         for name in [
             f"disc{n}_tracks.txt",
@@ -465,13 +517,15 @@ def step_chapters(cfg, disc_folders, structure, output_dir, discs_filter, tracks
 # MP4 step
 # ---------------------------------------------------------------------------
 
-def _disc_cover(disc, disc_folder, fallback):
-    """Resolve the base cover image for a disc (before per-track overrides)."""
-    covers_cfg = disc.get("covers")
+def _disc_cover(disc, disc_folder, fallback, album_covers=None, config_dir=None):
+    """Resolve the base cover image for a disc (before per-track overrides).
+    Disc-level covers take priority over album-level covers."""
+    config_dir = config_dir or disc_folder
+    covers_cfg = disc.get("covers") or album_covers
     if covers_cfg:
         images = covers_cfg.get("images", [])
         if images:
-            p = disc_folder / images[0]["file"]
+            p = _resolve_image(images[0]["file"], disc_folder, config_dir)
             if p.exists():
                 return p
     return fallback
@@ -512,14 +566,17 @@ def step_mp4(cfg, disc_folders, structure, output_dir, default_cover,
         if not meta_path.exists():
             sys.exit(f"ERROR: {meta_path} not found — run the chapters step first")
 
-        cover = _disc_cover(disc, folder, default_cover)
+        album_covers = cfg.get("covers")
+        config_dir = cfg["_config_dir"]
+        cover = _disc_cover(disc, folder, default_cover, album_covers, config_dir)
         if cover is None:
             sys.exit(
                 f"ERROR: no cover image for disc {n}. "
                 f"Use --cover or place cover.jpg in {folder}"
             )
 
-        schedule = build_image_schedule(disc, folder, cover, track_durations)
+        schedule = build_image_schedule(disc, folder, cover, track_durations,
+                                        album_covers, config_dir)
         mp4_path = output_dir / f"{cfg['title']} - Disc {n} {disc['name']}.mp4"
 
         if len(schedule) == 1:
@@ -554,7 +611,8 @@ def step_mp4(cfg, disc_folders, structure, output_dir, default_cover,
 # Podcast mode
 # ---------------------------------------------------------------------------
 
-def run_podcast(cfg, input_dir, output_dir, default_cover, number_outputs):
+def run_podcast(cfg, input_dir, output_dir, default_cover, number_outputs,
+                tracks_limit=None):
     print("\n=== podcast ===")
     output_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir = output_dir / "working"
@@ -566,10 +624,16 @@ def run_podcast(cfg, input_dir, output_dir, default_cover, number_outputs):
     else:
         items = [(f, {}) for f in sorted(input_dir.glob("*.mp3"))]
 
+    if tracks_limit:
+        items = items[:tracks_limit]
+
     covers_cfg = cfg.get("covers", {})
-    cover_images = [input_dir / e["file"] for e in covers_cfg.get("images", [])]
+    config_dir = cfg["_config_dir"]
+    cover_images = [_resolve_image(e["file"], input_dir, config_dir)
+                    for e in covers_cfg.get("images", [])]
     cover_mode = covers_cfg.get("mode", "hold")
 
+    total = len(items)
     for idx, (src, ep_meta) in enumerate(items, start=1):
         if ep_meta.get("title"):
             out_name = ep_meta["title"] + ".mp4"
@@ -578,6 +642,8 @@ def run_podcast(cfg, input_dir, output_dir, default_cover, number_outputs):
         else:
             out_name = src.stem + ".mp4"
         out_path = output_dir / out_name
+
+        print(f"  [{idx}/{total}] converting {out_name} ...")
 
         if ep_meta.get("cover"):
             cover = input_dir / ep_meta["cover"]
@@ -591,7 +657,7 @@ def run_podcast(cfg, input_dir, output_dir, default_cover, number_outputs):
         if cover is None:
             # Slideshow mode for this episode
             dur = get_duration(src)
-            schedule = _slideshow_schedule(covers_cfg, input_dir, dur)
+            schedule = _slideshow_schedule(covers_cfg, input_dir, config_dir, dur)
             img_concat = tmp_dir / f"pod_{idx:02d}_images.txt"
             _write_image_concat(schedule, img_concat)
             run_ffmpeg(
@@ -613,6 +679,23 @@ def run_podcast(cfg, input_dir, output_dir, default_cover, number_outputs):
             )
 
         print(f"  {src.name} → {out_name}")
+
+    _cleanup_intermediates(output_dir)
+
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+def _cleanup_intermediates(output_dir):
+    """Remove intermediate files produced during a run, keeping only final outputs."""
+    import shutil
+    working = output_dir / "working"
+    if working.exists():
+        shutil.rmtree(working)
+    for pattern in ("disc*_tracks.txt", "disc*_metadata.txt"):
+        for f in output_dir.glob(pattern):
+            f.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -665,7 +748,8 @@ def main():
         discs_filter = {int(d) for d in args.discs.split(",")}
 
     if cfg.get("mode") == "podcast":
-        run_podcast(cfg, input_dir, output_dir, default_cover, args.number_outputs)
+        run_podcast(cfg, input_dir, output_dir, default_cover, args.number_outputs,
+                    args.tracks)
         return
 
     structure = detect_structure(cfg, input_dir)
@@ -683,6 +767,7 @@ def main():
     if "mp4" in steps:
         step_mp4(cfg, disc_folders, structure, output_dir, default_cover,
                  discs_filter, args.tracks)
+        _cleanup_intermediates(output_dir)
 
     print("\nDone.")
 
