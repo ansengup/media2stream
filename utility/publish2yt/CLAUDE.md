@@ -1,8 +1,20 @@
 # publish2yt
 
-Uploads YouTube-ready MP4 files (produced by `album2yt`) to YouTube via the
-YouTube Data API v3. Handles authentication, video metadata, thumbnails,
-description templating, and playlist management.
+Manages YouTube publication of MP4 files produced by `album2yt`. Handles
+OAuth authentication, video metadata, thumbnails, description templating, and
+playlist management via the YouTube Data API v3.
+
+Supports two workflows depending on how videos are uploaded:
+
+- **Automated upload** — the script uploads MP4 files directly via the API
+  (`videos.insert`, 1,600 units/video). Full automation but quota-limited to
+  ~5–6 videos per day on the default 10,000-unit allowance.
+
+- **Manual upload + API metadata** *(recommended for large series)* — MP4 files
+  are uploaded through YouTube Studio by hand; the script then applies metadata
+  (title, description, tags, audience, privacy), thumbnails, and playlist
+  membership via `videos.update` (50 units/video). All 36 Vedantasara episodes
+  fit in a single day's quota.
 
 Part of the `media2stream` project.
 
@@ -13,13 +25,16 @@ Part of the `media2stream` project.
 1. Reads a publish config YAML file
 2. Authenticates with YouTube via OAuth 2.0 (browser-based first run, token
    cached for subsequent runs)
-3. For each episode MP4:
-   - Checks if already uploaded (skips if `youtube_id` already recorded)
-   - Uploads the MP4 using YouTube's resumable upload protocol
-   - Applies title, description (from template), tags, category, audience setting
-   - Sets thumbnail image
-   - Records the returned `youtube_id` back into the YAML for idempotency
-4. Creates or updates a YouTube playlist, adding each uploaded video in order
+3. Optionally runs `sync-ids`: lists the channel's recent uploads (including
+   private) via the uploads playlist and writes matched video IDs into the YAML
+4. For each episode:
+   - If no `youtube_id` is set → **upload step**: uploads the MP4 and sets
+     metadata in one `videos.insert` call
+   - If `youtube_id` is already set (manual upload workflow) → **metadata step**:
+     applies metadata via `videos.update`
+   - Uploads the thumbnail via `thumbnails.set`
+   - Records the `youtube_id` back into the YAML for idempotency
+5. Creates or updates a YouTube playlist, adding each uploaded video in order
 
 ---
 
@@ -207,24 +222,66 @@ granted after phone verification or sufficient channel history).
 
 ## Pipeline steps
 
-| Step | API calls | Description |
-|------|-----------|-------------|
-| `upload` | `videos.insert` | Upload MP4s and set title, description, tags, audience |
-| `thumbnail` | `thumbnails.set` | Upload and set thumbnail images |
-| `playlist` | `playlists.insert`, `playlistItems.insert` | Create playlist and add videos |
-| `all` | all of the above | Run all steps in order (default) |
+| Step | API call | Units | Description |
+|------|----------|-------|-------------|
+| `sync-ids` | `channels.list` + `playlistItems.list` | ~2 total | List the channel's uploads (including private) and match each to an episode by title. Writes `youtube_id` into YAML. Run after manual upload in YouTube Studio. |
+| `upload` | `videos.insert` | 1,600/video | Upload MP4 and set all metadata in one call. Skips episodes that already have a `youtube_id`. |
+| `metadata` | `videos.update` | 50/video | Apply title, description, tags, audience, privacy to existing videos. Requires `youtube_id`. Used in the manual upload workflow. |
+| `thumbnail` | `thumbnails.set` | 50/video | Upload and attach thumbnail image. Requires `youtube_id`. |
+| `playlist` | `playlists.insert` + `playlistItems.insert` | 50/video | Create playlist and add videos in order. Requires `youtube_id` on each episode. |
+| `all` | smart | — | Default. For each episode: runs `upload` if no `youtube_id` is set, otherwise runs `metadata`. Then runs `thumbnail` and `playlist` for all. |
 
-Steps can be combined: `--steps upload,thumbnail`. The `upload` step must
-precede `thumbnail` and `playlist` on first run (needs the `youtube_id`).
-Subsequent runs can run `thumbnail` or `playlist` alone using the stored IDs.
+`all` is intentionally smart: episodes without a `youtube_id` are uploaded
+automatically; episodes with a `youtube_id` already set (from manual YouTube
+Studio upload) have their metadata updated instead. This means you can mix
+the two workflows within a single YAML file and a single run.
+
+`thumbnail` and `playlist` always require `youtube_id` to be set (either by
+a prior `upload` run or manually). They can be run in isolation after the
+fact without re-uploading.
+
+---
+
+## Syncing video IDs from manually uploaded videos
+
+When using the manual upload workflow you don't need to copy-paste video IDs
+by hand. The `sync-ids` step queries the authenticated channel's uploads
+playlist and matches videos to episodes by title.
+
+### How it works
+
+1. Call `channels.list(part='contentDetails', mine=True)` → retrieves the
+   channel's uploads playlist ID (1 unit, one-time)
+2. Call `playlistItems.list(playlistId=<uploads_id>, part='snippet', maxResults=50)`
+   → pages through all recent uploads, including private videos (1 unit/page)
+3. For each episode in the YAML that has no `youtube_id`, find the upload whose
+   `snippet.title` matches the expected title (derived from `title_template`)
+4. Write the matched `youtube_id` back to the YAML
+
+Using the uploads playlist is preferred over `search.list` because it:
+- Costs 1 unit/page vs 100 units/page for `search.list`
+- Returns exact titles (no fuzzy search ambiguity)
+- Always includes private videos for the authenticated owner
+
+### Matching logic
+
+The expected title for each episode is rendered from `title_template`. The
+sync compares this against the `snippet.title` of each upload. Exact match
+is required; unmatched episodes are reported as warnings without writing
+anything, so the user can investigate.
+
+### API cost
+
+For 50 or fewer uploads: 2 units total (1 for channel lookup + 1 for playlist
+page). For more than 50 uploads: 1 additional unit per page of 50.
 
 ---
 
 ## Idempotency and state tracking
 
-After each successful upload the `youtube_id` is written back into the publish
-YAML file under the episode's `youtube_id:` field. Re-running the tool skips
-any episode that already has a `youtube_id`, making the process safe to
+After each successful operation the `youtube_id` is written back into the
+publish YAML file under the episode's `youtube_id:` field. Re-running the tool
+skips any episode that already has a `youtube_id`, making the process safe to
 interrupt and resume.
 
 Similarly, after playlist creation the playlist ID is written back to
@@ -232,7 +289,7 @@ Similarly, after playlist creation the playlist ID is written back to
 
 State is stored in-place in the YAML — there is no separate state file.
 
-Force re-upload of an already-uploaded episode with `--force`.
+Force re-processing of an already-processed episode with `--force`.
 
 ---
 
@@ -242,26 +299,38 @@ The YouTube Data API v3 has a default quota of **10,000 units per day**.
 
 | Operation | Cost |
 |---|---|
-| `videos.insert` (upload) | 1,600 units |
+| `videos.insert` (automated upload) | 1,600 units |
+| `videos.update` (metadata only) | 50 units |
 | `thumbnails.set` | 50 units |
-| `playlists.insert` | 50 units |
+| `playlists.insert` | 50 units (once per series) |
 | `playlistItems.insert` | 50 units |
 
-**Per episode cost:** 1,700 units (upload + thumbnail + add to playlist)  
-**Max uploads per day (default quota):** ~5 episodes
+### Automated upload workflow
 
-For 36 episodes, uploads will span approximately **7–8 days**.
+| | |
+|---|---|
+| Per episode | 1,700 units (`insert` + thumbnail + playlist item) |
+| Max per day | ~5 episodes |
+| 36 episodes | ~7–8 days |
+
+### Manual upload + API metadata workflow *(recommended)*
+
+| | |
+|---|---|
+| Per episode | 150 units (`update` + thumbnail + playlist item) |
+| Max per day | ~66 episodes |
+| 36 episodes | **1 day** (5,400 units total, well within limit) |
 
 The tool prints the estimated quota cost before each run and stops gracefully
-when the remaining daily quota would not cover the next upload. Re-run the
-next day; already-uploaded episodes are skipped automatically.
+when the budget for the day is exhausted. Re-run the next day; already-processed
+episodes are skipped automatically.
 
 To request a quota increase: Google Cloud Console → APIs → YouTube Data API v3
 → Quotas → Request higher quota.
 
 ---
 
-## Upload mechanics
+## Upload mechanics (automated workflow)
 
 YouTube requires **resumable uploads** for video files. The upload protocol:
 
@@ -306,10 +375,12 @@ Input:
   --input DIR           Folder containing MP4 files (overrides input_dir in YAML)
 
 Pipeline control:
-  --steps STEPS         upload,thumbnail,playlist,all (default: all)
+  --steps STEPS         sync-ids,upload,metadata,thumbnail,playlist,all (default: all)
   --episodes LIST       Comma-separated episode numbers to process (default: all)
-  --dry-run             Print what would be uploaded; make no API calls
-  --force               Re-upload even if youtube_id already set
+  --limit N             Process only the first N episodes; useful for testing a step
+                        before running against all episodes
+  --dry-run             Print what would happen; make no API calls
+  --force               Re-process even if youtube_id already set
 
 Auth:
   --client-secrets FILE Path to client_secrets.json
@@ -322,26 +393,32 @@ Auth:
 ### Usage examples
 
 ```bash
+# --- Manual upload workflow (recommended for large series) ---
+
+# After uploading in YouTube Studio, sync video IDs from the channel
+./publish2yt.py --config vedantasara-publish.yaml --steps sync-ids
+
+# Then apply metadata, thumbnails, and playlist in one day
+./publish2yt.py --config vedantasara-publish.yaml --steps metadata,thumbnail,playlist
+
+# --- Automated upload workflow ---
+
 # Full pipeline — upload all episodes, set thumbnails, create playlist
 ./publish2yt.py --config workingdir/vedantasara/vedantasara-publish.yaml
 
-# Dry run — preview what would be uploaded
+# Dry run — preview what would happen
 ./publish2yt.py --config vedantasara-publish.yaml --dry-run
 
-# Upload only (skip thumbnail and playlist steps)
-./publish2yt.py --config vedantasara-publish.yaml --steps upload
-
 # Upload specific episodes only
-./publish2yt.py --config vedantasara-publish.yaml --episodes 1,2,3
+./publish2yt.py --config vedantasara-publish.yaml --steps upload --episodes 1,2,3
+
+# --- Common operations ---
 
 # Set thumbnails for already-uploaded episodes
 ./publish2yt.py --config vedantasara-publish.yaml --steps thumbnail
 
-# Create/update playlist using already-recorded youtube_ids
+# Create/update playlist using stored youtube_ids
 ./publish2yt.py --config vedantasara-publish.yaml --steps playlist
-
-# Force re-upload of episode 3 even if it has a youtube_id
-./publish2yt.py --config vedantasara-publish.yaml --episodes 3 --force
 
 # Re-authenticate (e.g. switching YouTube channels)
 ./publish2yt.py --config vedantasara-publish.yaml --reauth
@@ -353,7 +430,7 @@ Auth:
 
 | File | Description |
 |------|-------------|
-| `publish2yt.py` | Main Python script (not yet implemented) |
+| `publish2yt.py` | Main Python script |
 | `<series>-publish.yaml` | Publish config: episode list, metadata, templates |
 | `templates/description.txt` | Optional description template |
 | `~/.config/publish2yt/client_secrets.json` | OAuth client secrets (not committed) |
@@ -375,7 +452,7 @@ PyYAML>=6.0
 
 ## Out of scope
 
-- Editing or deleting existing YouTube videos
+- Deleting existing YouTube videos
 - YouTube Analytics / comments
 - Batch scheduling (publishing at a future date) — set `privacy: private` first,
   then manually schedule in YouTube Studio

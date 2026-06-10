@@ -36,10 +36,45 @@ These steps create the credentials that allow the tool to upload on your behalf.
 
 ---
 
-## Quick start
+## Choosing a workflow
 
-Given an `album2yt` podcast output at `workingdir/vedantasara/output/`, create
-a publish config YAML alongside it:
+There are two ways to get videos onto YouTube. The choice depends on how many
+videos you are publishing and whether you have already uploaded them manually.
+
+### Manual upload + API metadata *(recommended for series)*
+
+Upload MP4 files in YouTube Studio by hand (no API quota used for uploads),
+then use this script to apply metadata, thumbnails, and the playlist.
+
+| | |
+|---|---|
+| API cost per video | ~150 units |
+| 36-episode series | ~5,400 units — fits in one day |
+
+```
+1. Upload MP4s in YouTube Studio (set to Private)
+2. Run: publish2yt --steps sync-ids   ← finds video IDs automatically
+3. Run: publish2yt --steps metadata,thumbnail,playlist
+```
+
+### Automated upload
+
+The script uploads MP4 files directly.
+
+| | |
+|---|---|
+| API cost per video | ~1,700 units |
+| 36-episode series | ~61,000 units — ~7–8 days |
+
+```
+1. Run: publish2yt   ← uploads, sets metadata, thumbnail, playlist in one run
+```
+
+---
+
+## Quick start (manual workflow)
+
+Given an `album2yt` podcast output at `workingdir/vedantasara/output/`:
 
 ```
 workingdir/vedantasara/
@@ -53,11 +88,18 @@ workingdir/vedantasara/
     ...
 ```
 
-Then run:
-
-```bash
-./publish2yt.py --config workingdir/vedantasara/vedantasara-publish.yaml
-```
+1. Upload MP4s in YouTube Studio, setting each to **Private**.
+2. Sync the video IDs back to the YAML automatically:
+   ```bash
+   ./publish2yt.py --config workingdir/vedantasara/vedantasara-publish.yaml --steps sync-ids
+   ```
+   The script lists the channel's recent uploads (including private videos) and
+   matches them to episodes by title, writing `youtube_id` into the YAML.
+3. Apply metadata, thumbnails, and create the playlist:
+   ```bash
+   ./publish2yt.py --config workingdir/vedantasara/vedantasara-publish.yaml \
+     --steps metadata,thumbnail,playlist
+   ```
 
 ---
 
@@ -304,21 +346,30 @@ complying with COPPA. Most spiritual/educational content should use this.
 
 ## Pipeline steps
 
-Run all steps (default):
+| Step | What it does | Requires `youtube_id`? |
+|------|-------------|------------------------|
+| `sync-ids` | Looks up private/public videos on your channel by title and writes `youtube_id` into the YAML. | No |
+| `upload` | Uploads MP4 files via API. Skips episodes that already have a `youtube_id`. | No |
+| `metadata` | Updates title, description, tags, audience, privacy on existing videos. | Yes |
+| `thumbnail` | Uploads and sets thumbnail images. | Yes |
+| `playlist` | Creates the playlist and adds videos in order. | Yes |
+| `all` | Smart default: `upload` for episodes without an ID, `metadata` for those with one, then `thumbnail` and `playlist` for all. | — |
+
 ```bash
-./publish2yt.py --config vedantasara-publish.yaml
-```
+# Manual upload workflow
+./publish2yt.py --config vedantasara-publish.yaml --steps sync-ids
+./publish2yt.py --config vedantasara-publish.yaml --steps metadata,thumbnail,playlist
 
-Run individual steps:
+# Automated upload workflow
+./publish2yt.py --config vedantasara-publish.yaml   # runs all steps
 
-```bash
-# Upload only — save thumbnail and playlist for later
-./publish2yt.py --config vedantasara-publish.yaml --steps upload
+# Update metadata only (e.g. to fix a description)
+./publish2yt.py --config vedantasara-publish.yaml --steps metadata
 
-# Set thumbnails for already-uploaded videos
+# Add thumbnails after the fact
 ./publish2yt.py --config vedantasara-publish.yaml --steps thumbnail
 
-# Create/update playlist (uses stored youtube_ids)
+# Rebuild the playlist
 ./publish2yt.py --config vedantasara-publish.yaml --steps playlist
 ```
 
@@ -338,23 +389,32 @@ episodes:
 Re-running skips any episode that already has a `youtube_id`. You can safely
 interrupt and resume — only unfinished episodes are processed.
 
-To re-upload an already-uploaded episode:
+To re-process an already-processed episode (e.g. to update its metadata):
 ```bash
-./publish2yt.py --config vedantasara-publish.yaml --episodes 1 --force
+./publish2yt.py --config vedantasara-publish.yaml --steps metadata --episodes 1 --force
 ```
 
 ---
 
 ## YouTube quota limits
 
-The YouTube API allows approximately **5–6 video uploads per day** on the
-default quota. For a 36-episode series, uploads will take about 7–8 days.
+The YouTube Data API v3 has a default quota of 10,000 units per day.
 
-The tool shows the quota estimate before each run and stops gracefully when the
-budget for the day is exhausted. Re-run the next day — already-uploaded episodes
-are skipped automatically.
+| Workflow | API cost per video | 36 episodes |
+|---|---|---|
+| Automated upload (`videos.insert`) | ~1,700 units | ~7–8 days |
+| Manual upload + API metadata (`videos.update`) | ~150 units | **1 day** |
 
-To increase your daily quota, visit Google Cloud Console → APIs & Services →
+The manual upload workflow is strongly recommended for any series longer than
+5 episodes. Upload the MP4s through YouTube Studio, run `sync-ids` to collect
+the video IDs, then apply metadata, thumbnails, and the playlist via API — all
+36 episodes fit comfortably within one day's quota.
+
+The tool prints the estimated quota cost before each run and stops gracefully
+when the budget for the day is exhausted. Re-run the next day — already-processed
+episodes are skipped automatically.
+
+To increase your daily quota: Google Cloud Console → APIs & Services →
 YouTube Data API v3 → Quotas → Request higher quota.
 
 ---
@@ -371,10 +431,12 @@ Input:
   --input DIR       Folder containing MP4 files (overrides input_dir in YAML)
 
 Pipeline control:
-  --steps STEPS     upload,thumbnail,playlist,all (default: all)
+  --steps STEPS     sync-ids,upload,metadata,thumbnail,playlist,all (default: all)
   --episodes LIST   Comma-separated episode numbers to process (default: all)
-  --dry-run         Preview what would be uploaded; make no API calls
-  --force           Re-upload even if youtube_id is already set
+  --limit N         Process only the first N episodes; use to test a step on a
+                    small batch before running against all episodes
+  --dry-run         Preview what would happen; make no API calls
+  --force           Re-process even if youtube_id is already set
 
 Auth:
   --client-secrets FILE  Path to client_secrets.json
@@ -387,15 +449,41 @@ Auth:
 ### Examples
 
 ```bash
-# Full pipeline — upload all, set thumbnails, create playlist
+# --- Manual upload workflow (recommended) ---
+
+# After uploading in YouTube Studio, find and record the video IDs
+./publish2yt.py --config vedantasara-publish.yaml --steps sync-ids
+
+# Apply metadata, thumbnails, and playlist (all 36 episodes, one day)
+./publish2yt.py --config vedantasara-publish.yaml --steps metadata,thumbnail,playlist
+
+# --- Automated upload workflow ---
+
+# Upload everything via API (runs all steps)
 ./publish2yt.py --config workingdir/vedantasara/vedantasara-publish.yaml
 
-# Preview without uploading
+# Preview without making any API calls
 ./publish2yt.py --config vedantasara-publish.yaml --dry-run
 
-# Upload only episodes 1–3
-./publish2yt.py --config vedantasara-publish.yaml --episodes 1,2,3
+# Upload only specific episodes
+./publish2yt.py --config vedantasara-publish.yaml --steps upload --episodes 1,2,3
 
-# Force re-authenticate (e.g. switching YouTube channels)
+# --- Testing ---
+
+# Test metadata+thumbnail+playlist on the first 3 episodes before running all 36
+./publish2yt.py --config vedantasara-publish.yaml --steps metadata,thumbnail,playlist --limit 3
+
+# Dry-run the same to preview without any API calls
+./publish2yt.py --config vedantasara-publish.yaml --steps metadata,thumbnail,playlist --limit 3 --dry-run
+
+# --- Fixes and corrections ---
+
+# Update the description on all episodes (already uploaded)
+./publish2yt.py --config vedantasara-publish.yaml --steps metadata
+
+# Re-apply metadata to one episode, overwriting what's there
+./publish2yt.py --config vedantasara-publish.yaml --steps metadata --episodes 5 --force
+
+# Re-authenticate (e.g. switching YouTube channels)
 ./publish2yt.py --config vedantasara-publish.yaml --reauth
 ```
